@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Sky Biplane</title>
+<style>
+:root{--bg:#cfe8fb;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0e141c}}
+:root[data-theme="dark"]{--bg:#0e141c}
+html,body{height:100%;margin:0}
+body{background:var(--bg);display:flex;align-items:center;justify-content:center;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none;font-family:system-ui,sans-serif}
+canvas{width:min(100vw,calc(100vh*1.6667));aspect-ratio:800/480;display:block;border-radius:6px;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c" width="800" height="480"></canvas>
+<script>
+/* ============ SETUP ============ */
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const W = 800, H = 480, GROUND = 440;
+const G = 0.4, LIFT = 0.95, VMIN = -6, VMAX = 7;      // physics constants
+const START = 0, PLAYING = 1, PAUSED = 2, OVER = 3;     // game states
+let state = START, best = 0;
+try { best = +localStorage.getItem('skybiplane_best') || 0; } catch (e) {}
+
+/* ============ AUDIO (synthesized, Web Audio API) ============ */
+let ac = null, eng = null, engGain = null, noiseBuf = null;
+function initAudio() {
+  if (ac) { if (ac.state === 'suspended') ac.resume(); return; }
+  try {
+    ac = new (window.AudioContext || window.webkitAudioContext)();
+    // Engine hum: sawtooth through a lowpass filter
+    eng = ac.createOscillator(); eng.type = 'sawtooth'; eng.frequency.value = 70;
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 400;
+    engGain = ac.createGain(); engGain.gain.value = 0;
+    eng.connect(lp); lp.connect(engGain); engGain.connect(ac.destination); eng.start();
+    // White-noise buffer for explosions
+    noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  } catch (e) { ac = null; }
+}
+function tone(f, t0, dur, type, vol) {
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type; o.frequency.value = f;
+  g.gain.setValueAtTime(vol, ac.currentTime + t0);
+  g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + t0 + dur);
+  o.connect(g); g.connect(ac.destination);
+  o.start(ac.currentTime + t0); o.stop(ac.currentTime + t0 + dur);
+}
+function sfxCoin(v) { if (!ac) return; const b = 660 + v * 8; tone(b, 0, .12, 'sine', .15); tone(b * 1.5, .08, .22, 'sine', .15); }
+function sfxCrash(big) {
+  if (!ac) return;
+  const s = ac.createBufferSource(); s.buffer = noiseBuf;
+  const f = ac.createBiquadFilter(); f.type = 'lowpass';
+  f.frequency.setValueAtTime(2000, ac.currentTime);
+  f.frequency.exponentialRampToValueAtTime(80, ac.currentTime + (big ? 1 : .4));
+  const g = ac.createGain(); g.gain.setValueAtTime(big ? .5 : .3, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(.001, ac.currentTime + (big ? 1 : .4));
+  s.connect(f); f.connect(g); g.connect(ac.destination); s.start();
+  tone(big ? 90 : 140, 0, big ? .8 : .3, 'square', .12);
+}
+function engineSound(thrust) {
+  if (!ac) return;
+  const on = state === PLAYING;
+  engGain.gain.setTargetAtTime(on ? (thrust ? .06 : .02) : 0, ac.currentTime, .05);
+  eng.frequency.setTargetAtTime(thrust ? 95 : 65, ac.currentTime, .1);
+}
+
+/* ============ INPUT ============ */
+const keys = new Set(); let pointerDown = false;
+const isThrust = () => keys.size > 0 || pointerDown;
+function press() {
+  initAudio();
+  if (state === START) startGame();
+  else if (state === PAUSED) state = PLAYING;
+  else if (state === OVER && overTimer > 30) startGame();
+}
+addEventListener('keydown', e => {
+  if (['Space', 'ArrowUp', 'KeyW'].includes(e.code)) {
+    e.preventDefault(); if (!keys.has(e.code)) press(); keys.add(e.code);
+  } else if (e.code === 'Enter') press();
+  else if (e.code === 'KeyP' || e.code === 'Escape') {
+    if (state === PLAYING) state = PAUSED; else if (state === PAUSED) state = PLAYING;
+  }
+});
+addEventListener('keyup', e => keys.delete(e.code));
+cv.addEventListener('pointerdown', e => { e.preventDefault(); pointerDown = true; press(); });
+addEventListener('pointerup', () => pointerDown = false);
+addEventListener('pointercancel', () => pointerDown = false);
+addEventListener('blur', () => { keys.clear(); pointerDown = false; if (state === PLAYING) state = PAUSED; });
+document.addEventListener('visibilitychange', () => { if (document.hidden && state === PLAYING) state = PAUSED; });
+
+/* ============ GAME DATA ============ */
+let plane, obstacles, coins, parts, frames, dist, bonus, speed, spawnT, hearts, shake, overTimer = 0, newBest = false;
+const rand = (a, b) => a + Math.random() * (b - a);
+
+function startGame() {
+  plane = { x: 150, y: 220, vy: 0, r: 14, ang: 0, inv: 0, prop: 0 };
+  obstacles = []; coins = []; parts = [];
+  frames = 0; dist = 0; bonus = 0; speed = 3.4; spawnT = 200; hearts = 3; shake = 0; newBest = false;
+  state = PLAYING;
+}
+startGame(); state = START;
+
+/* ============ OBSTACLES & COLLISION ============ */
+function spawnObstacle() {
+  const x = W + 100, k = Math.random(), o = { x };
+  if (k < .3)      Object.assign(o, { t: 'mtn', w: rand(110, 170), h: rand(110, 220) });
+  else if (k < .5) Object.assign(o, { t: 'tower', w: 26, h: rand(90, 190) });
+  else if (k < .78)Object.assign(o, { t: 'cloud', r: rand(34, 52), y: rand(70, 340) });
+  else             Object.assign(o, { t: 'blimp', w: 120, h: 44, y: rand(80, 330), ph: rand(0, 6) });
+  obstacles.push(o);
+  // Reward corridor: a short row of coins midway to the next obstacle
+  const gap = Math.max(280, rand(300, 420) - frames / 90);
+  spawnT = gap;
+  const n = 3 + (Math.random() * 3 | 0), cx = x + gap / 2 - n * 15, tier = Math.random();
+  const val = tier < .55 ? 10 : tier < .87 ? 25 : 50;
+  let y = 200;
+  for (let tries = 0; tries < 10; tries++) {
+    y = rand(110, 360);
+    if (!obstacles.some(q => hit(q, cx, y, 18, true))) break;
+  }
+  for (let i = 0; i < n; i++) coins.push({ x: cx + i * 30, y: y + Math.sin(i) * 14, v: val, a: rand(0, 6) });
+}
+function oy(o) { return o.t === 'blimp' ? o.y + Math.sin(frames * .03 + o.ph) * 14 : o.y; }
+// Returns true if circle (px,py,r) touches obstacle o
+function hit(o, px, py, r, loose) {
+  if (o.t === 'mtn') {
+    for (const dx of [-.7 * r, 0, .7 * r]) {
+      const d = Math.abs(px + dx - o.x);
+      if (d < o.w / 2 && py + r * .8 > GROUND - o.h * (1 - d / (o.w / 2))) return true;
+    }
+    return false;
+  }
+  if (o.t === 'tower') {
+    const cx = Math.max(o.x - o.w / 2, Math.min(px, o.x + o.w / 2));
+    const cy = Math.max(GROUND - o.h, Math.min(py, GROUND));
+    return (px - cx) ** 2 + (py - cy) ** 2 < r * r;
+  }
+  if (o.t === 'cloud') return (px - o.x) ** 2 + (py - o.y) ** 2 < (o.r * .85 + r * .7) ** 2;
+  const rx = o.w / 2 + r * .6, ry = o.h / 2 + r * .6;
+  return ((px - o.x) / rx) ** 2 + ((py - oy(o)) / ry) ** 2 < 1;
+}
+
+/* ============ PARTICLES ============ */
+function burst(x, y, n, cols, sp, life) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, 6.283), s = rand(.3, 1) * sp;
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, l: life * rand(.6, 1), m: life, r: rand(2, 5), c: cols[i % cols.length] });
+  }
+}
+
+/* ============ UPDATE (fixed 60Hz step = deterministic) ============ */
+function update() {
+  if (state === OVER) overTimer++;
+  if (state !== PLAYING) { engineSound(false); stepParts(); return; }
+  frames++;
+  speed = 3.4 + Math.min(4.5, frames / 1500);            // difficulty curve
+  const thrust = isThrust();
+  // Vertical physics: gravity always, lift while thrusting, clamped velocity
+  plane.vy += G; if (thrust) plane.vy -= LIFT;
+  plane.vy = Math.max(VMIN, Math.min(VMAX, plane.vy));
+  plane.y += plane.vy;
+  plane.ang += (Math.max(-.6, Math.min(.75, plane.vy * .08)) - plane.ang) * .2;  // pitch follows velocity
+  plane.prop += .9; if (plane.inv > 0) plane.inv--;
+  dist += speed / 8;
+  if (plane.y < plane.r) { plane.y = plane.r; plane.vy = 0; }
+  if (plane.y > GROUND - plane.r) { plane.y = GROUND - plane.r; plane.vy = -6; damage(); }
+  // Spawning
+  spawnT -= speed; if (spawnT <= 0) spawnObstacle();
+  for (const o of obstacles) { o.x -= speed; if (plane.inv <= 0 && hit(o, plane.x, plane.y, plane.r)) { damage(); } }
+  obstacles = obstacles.filter(o => o.x > -200);
+  // Coins
+  for (const c of coins) {
+    c.x -= speed; c.a += .08;
+    if (!c.got && (c.x - plane.x) ** 2 + (c.y - plane.y) ** 2 < (plane.r + 13) ** 2) {
+      c.got = true; bonus += c.v; sfxCoin(c.v);
+      burst(c.x, c.y, 12, c.v >= 50 ? ['#ffd34d', '#fff1a8'] : c.v >= 25 ? ['#d6dde5', '#fff'] : ['#cd7f32', '#e8a96a'], 3, 30);
+    }
+  }
+  coins = coins.filter(c => !c.got && c.x > -30);
+  // Smoke trail
+  if (frames % 3 === 0) parts.push({ x: plane.x - 24, y: plane.y + 4, vx: -speed * .8, vy: rand(-.3, .3), l: 35, m: 35, r: rand(3, 6), c: '#e6e6e6', smoke: 1 });
+  stepParts(); engineSound(thrust);
+  if (shake > 0) shake--;
+}
+function stepParts() {
+  for (const p of parts) { p.x += p.vx; p.y += p.vy; p.l--; if (!p.smoke) p.vy += .08; }
+  parts = parts.filter(p => p.l > 0);
+}
+function damage() {
+  if (plane.inv > 0) return;
+  hearts--; plane.inv = 100; shake = 14;
+  burst(plane.x, plane.y, 24, ['#ff7a1a', '#ffd34d', '#555'], 4, 40);
+  if (hearts <= 0) {
+    sfxCrash(true); burst(plane.x, plane.y, 60, ['#ff4d1a', '#ffd34d', '#333', '#fff'], 7, 60);
+    state = OVER; overTimer = 0; shake = 30;
+    const sc = score(); if (sc > best) { best = sc; newBest = true; try { localStorage.setItem('skybiplane_best', best); } catch (e) {} }
+  } else sfxCrash(false);
+}
+const score = () => (dist | 0) + bonus;
+
+/* ============ DRAWING ============ */
+function star(x, y, r, rot) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) { const a = rot + i * Math.PI / 5 - Math.PI / 2, rr = i % 2 ? r * .45 : r; ctx.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr); }
+  ctx.closePath();
+}
+function ridge(off, base, amp, f, col) {   // parallax mountain/hill layer
+  ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(0, H);
+  for (let x = 0; x <= W; x += 8) ctx.lineTo(x, base - (Math.abs(Math.sin((x + off) * f)) * amp + Math.sin((x + off) * f * 2.3) * amp * .3));
+  ctx.lineTo(W, H); ctx.fill();
+}
+function cloudShape(x, y, s) {
+  ctx.beginPath(); ctx.arc(x, y, 22 * s, 0, 7); ctx.arc(x + 25 * s, y - 8 * s, 26 * s, 0, 7); ctx.arc(x + 52 * s, y, 20 * s, 0, 7); ctx.fill();
+}
+function drawBackground() {
+  const t = state === PLAYING || state === OVER ? frames : (performance.now() / 16 | 0);
+  const g = ctx.createLinearGradient(0, 0, 0, GROUND); g.addColorStop(0, '#5aa9e6'); g.addColorStop(1, '#bfe3ff');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#fff6c9'; ctx.beginPath(); ctx.arc(640, 90, 34, 0, 7); ctx.fill();
+  ridge(t * speed * .15, 330, 90, .006, '#8fb4d9');
+  ridge(t * speed * .4, 400, 60, .01, '#6faa7a');
+  ctx.fillStyle = 'rgba(255,255,255,.75)';
+  for (let i = 0; i < 5; i++) { const x = ((i * 220 - t * speed * (.5 + i % 3 * .15)) % 1100 + 1100) % 1100 - 150; cloudShape(x, 70 + (i * 53) % 190, .8 + i % 3 * .3); }
+  ctx.fillStyle = '#4c8f4a'; ctx.fillRect(0, GROUND, W, H - GROUND);
+  ctx.fillStyle = '#3d7a3c'; for (let x = -(t * speed) % 60; x < W; x += 60) ctx.fillRect(x, GROUND + 14, 30, 6);
+}
+function drawObstacle(o) {
+  if (o.t === 'mtn') {
+    ctx.fillStyle = '#6b6f78'; ctx.beginPath(); ctx.moveTo(o.x - o.w / 2, GROUND); ctx.lineTo(o.x, GROUND - o.h); ctx.lineTo(o.x + o.w / 2, GROUND); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.moveTo(o.x, GROUND - o.h); ctx.lineTo(o.x - o.w * .13, GROUND - o.h * .8); ctx.lineTo(o.x + o.w * .13, GROUND - o.h * .8); ctx.fill();
+  } else if (o.t === 'tower') {
+    const top = GROUND - o.h;
+    ctx.fillStyle = '#7a5c3a'; ctx.fillRect(o.x - o.w / 2, top, o.w, o.h);
+    ctx.fillStyle = '#4a4f57'; ctx.fillRect(o.x - 22, top - 10, 44, 14);
+    ctx.save(); ctx.translate(o.x, top - 4); ctx.rotate(Math.atan2(plane.y - top, plane.x - o.x)); ctx.fillRect(0, -3, 28, 6); ctx.restore();
+  } else if (o.t === 'cloud') {
+    ctx.fillStyle = '#4b4f63';
+    for (const [dx, dy, k] of [[-.6, .2, .6], [0, -.1, .85], [.6, .2, .6], [.1, .4, .55]]) { ctx.beginPath(); ctx.arc(o.x + dx * o.r, o.y + dy * o.r, o.r * k, 0, 7); ctx.fill(); }
+    if (frames % 80 < 5) { ctx.strokeStyle = '#ffe14d'; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(o.x, o.y + 10); ctx.lineTo(o.x - 10, o.y + 30); ctx.lineTo(o.x + 4, o.y + 32); ctx.lineTo(o.x - 8, o.y + 56); ctx.stroke(); }
+  } else {
+    const y = oy(o);
+    ctx.fillStyle = '#c0392b'; ctx.beginPath(); ctx.ellipse(o.x, y, o.w / 2, o.h / 2, 0, 0, 7); ctx.fill();
+    ctx.fillStyle = '#f2d16b'; ctx.fillRect(o.x - 6, y - o.h / 2, 12, o.h);
+    ctx.fillStyle = '#444'; ctx.fillRect(o.x - 14, y + o.h / 2, 28, 10);
+    ctx.fillStyle = '#a02d22'; ctx.beginPath(); ctx.moveTo(o.x + o.w / 2 - 10, y); ctx.lineTo(o.x + o.w / 2 + 16, y - 18); ctx.lineTo(o.x + o.w / 2 + 16, y + 18); ctx.fill();
+  }
+}
+function drawPlane() {
+  if (plane.inv > 0 && (plane.inv / 5 | 0) % 2) return;   // blink while invulnerable
+  ctx.save(); ctx.translate(plane.x, plane.y); ctx.rotate(plane.ang);
+  ctx.fillStyle = '#d63031'; ctx.beginPath(); ctx.moveTo(24, 0); ctx.bezierCurveTo(20, -13, -10, -12, -26, -3); ctx.lineTo(-26, 3); ctx.bezierCurveTo(-10, 12, 20, 13, 24, 0); ctx.fill();
+  ctx.fillStyle = '#f2d16b'; ctx.fillRect(-12, -17, 26, 5); ctx.fillRect(-14, 9, 28, 5);   // biplane wings
+  ctx.strokeStyle = '#333'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(-6, -12); ctx.lineTo(-6, 9); ctx.moveTo(8, -12); ctx.lineTo(8, 9); ctx.stroke();
+  ctx.fillStyle = '#a82424'; ctx.beginPath(); ctx.moveTo(-26, -2); ctx.lineTo(-34, -14); ctx.lineTo(-20, -4); ctx.fill();   // tail fin
+  ctx.fillStyle = '#ffe9c4'; ctx.beginPath(); ctx.arc(-2, -7, 5, 0, 7); ctx.fill();    // pilot
+  ctx.fillStyle = '#222'; ctx.beginPath(); ctx.arc(6, 12, 4, 0, 7); ctx.fill();         // wheel
+  ctx.strokeStyle = '#222'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(26, Math.sin(plane.prop) * 14); ctx.lineTo(26, -Math.sin(plane.prop) * 14); ctx.stroke();  // propeller
+  ctx.restore();
+}
+function drawHUD() {
+  for (let i = 0; i < 3; i++) {
+    ctx.fillStyle = i < hearts ? '#e84118' : 'rgba(0,0,0,.3)';
+    const x = 24 + i * 30, y = 28;
+    ctx.beginPath(); ctx.moveTo(x, y + 6); ctx.bezierCurveTo(x - 14, y - 6, x - 4, y - 14, x, y - 5); ctx.bezierCurveTo(x + 4, y - 14, x + 14, y - 6, x, y + 6); ctx.fill();
+  }
+  ctx.fillStyle = '#10243a'; ctx.font = 'bold 22px system-ui,sans-serif'; ctx.textAlign = 'right';
+  ctx.fillText(score() + ' pts', W - 16, 30);
+  ctx.font = '14px system-ui,sans-serif'; ctx.fillText('Best ' + best, W - 16, 50);
+}
+function overlay(title, lines) {
+  ctx.fillStyle = 'rgba(8,20,36,.62)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.fillStyle = '#fff'; ctx.font = 'bold 48px system-ui,sans-serif'; ctx.fillText(title, W / 2, 170);
+  ctx.font = '20px system-ui,sans-serif';
+  lines.forEach((l, i) => ctx.fillText(l, W / 2, 225 + i * 32));
+}
+function draw() {
+  ctx.save();
+  if (shake > 0) ctx.translate(rand(-shake, shake) * .4, rand(-shake, shake) * .4);
+  drawBackground();
+  obstacles.forEach(drawObstacle);
+  for (const c of coins) {
+    ctx.fillStyle = c.v >= 50 ? '#ffd34d' : c.v >= 25 ? '#d6dde5' : '#cd7f32';
+    ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 1.5;
+    star(c.x, c.y + Math.sin(c.a) * 3, 13, c.a * .3); ctx.fill(); ctx.stroke();
+  }
+  for (const p of parts) { ctx.globalAlpha = Math.max(0, p.l / p.m); ctx.fillStyle = p.c; ctx.beginPath(); ctx.arc(p.x, p.y, p.r * (p.smoke ? 2 - p.l / p.m : 1), 0, 7); ctx.fill(); }
+  ctx.globalAlpha = 1;
+  if (state !== OVER || overTimer < 2) drawPlane();
+  ctx.restore();
+  if (state !== START) drawHUD();
+  if (state === START) overlay('SKY BIPLANE', ['Hold SPACE / UP / click / touch to climb', 'Release to descend. Dodge hazards, grab stars!', 'Tap or press to take off', 'Best: ' + best]);
+  else if (state === PAUSED) overlay('PAUSED', ['Press P, Esc, or tap to resume']);
+  else if (state === OVER) overlay('CRASHED!', ['Score: ' + score() + (newBest ? '  - NEW BEST!' : ''), 'Best: ' + best, overTimer > 30 ? 'Tap or press Enter to fly again' : '']);
+}
+
+/* ============ MAIN LOOP ============ */
+let last = 0, acc = 0;
+function loop(t) {
+  acc += Math.min(50, t - last); last = t;
+  while (acc >= 1000 / 60) { update(); acc -= 1000 / 60; }
+  draw(); requestAnimationFrame(loop);
+}
+requestAnimationFrame(t => { last = t; loop(t); });
+</script>
+</body>
+</html>
